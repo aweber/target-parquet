@@ -1,3 +1,5 @@
+import datetime
+import decimal
 import os
 
 import pandas as pd
@@ -8,15 +10,15 @@ from singer_sdk.helpers._flattening import flatten_schema
 
 from target_parquet.utils.parquet import (
     EXTENSION_MAPPING,
+    _convert_decimal,
+    _convert_temporal,
     _field_type_to_pyarrow_field,
     concat_tables,
     create_pyarrow_table,
     flatten_schema_to_pyarrow_schema,
     get_pyarrow_table_size,
     write_parquet_file,
-    _convert_decimal
 )
-from decimal import Decimal
 
 @pytest.fixture()
 def sample_data():
@@ -59,8 +61,8 @@ def test_flatten_schema_to_pyarrow_schema():
             pa.field("int", pa.int64()),
             pa.field("decimal", pa.float64()),
             pa.field("decimal2", pa.float64()),
-            pa.field("date", pa.string()),
-            pa.field("datetime", pa.string()),
+            pa.field("date", pa.timestamp('us', tz='UTC')),
+            pa.field("datetime", pa.timestamp('us', tz='UTC')),
             pa.field("boolean", pa.bool_()),
         ]
     )
@@ -212,7 +214,7 @@ def test_get_pyarrow_table_size(sample_data, sample_schema):
 
 
 def test_convert_decimal_with_decimal():
-    value = Decimal("10.5")
+    value = decimal.Decimal("10.5")
     result = _convert_decimal(value)
     assert isinstance(result, float)
     assert result == 10.5
@@ -229,8 +231,8 @@ def test_create_pyarrow_table_with_decimal_conversion():
     ])
 
     data = [
-        {"id": 1, "price": Decimal("9.99")},
-        {"id": 2, "price": Decimal("19.99")}
+        {"id": 1, "price": decimal.Decimal("9.99")},
+        {"id": 2, "price": decimal.Decimal("19.99")}
     ]
 
     table = create_pyarrow_table(data, schema)
@@ -239,3 +241,80 @@ def test_create_pyarrow_table_with_decimal_conversion():
     assert table.num_rows == 2
     assert table.column("price").to_pylist() == [9.99, 19.99]
     assert table.column("id").to_pylist() == [1, 2]
+
+
+def test_field_type_to_pyarrow_field_with_date_time_format():
+    """Test format field takes precedence over type for temporal fields."""
+    result = _field_type_to_pyarrow_field(
+        "created_at",
+        {"type": ["null", "string"], "format": "date-time"},
+        []
+    )
+    assert result == pa.field("created_at", pa.timestamp('us', tz='UTC'), nullable=True)
+
+
+def test_field_type_to_pyarrow_field_with_date_format():
+    """Test date format mapping."""
+    result = _field_type_to_pyarrow_field(
+        "birth_date",
+        {"type": "string", "format": "date"},
+        ["birth_date"]
+    )
+    assert result == pa.field("birth_date", pa.date32(), nullable=False)
+
+
+@pytest.mark.parametrize("value, field_type, expected", [
+    # Timestamp with Z suffix
+    ("2024-01-15T10:30:45Z", pa.timestamp('us', tz='UTC'),
+     datetime.datetime(2024, 1, 15, 10, 30, 45, tzinfo=datetime.timezone.utc)),
+    # Timestamp with timezone offset
+    ("2024-01-15T10:30:45-05:00", pa.timestamp('us', tz='UTC'),
+     datetime.datetime(2024, 1, 15, 15, 30, 45, tzinfo=datetime.timezone.utc)),  # Converted to UTC
+    # Timestamp with microseconds
+    ("2024-01-15T10:30:45.123456Z", pa.timestamp('us', tz='UTC'),
+     datetime.datetime(2024, 1, 15, 10, 30, 45, 123456, tzinfo=datetime.timezone.utc)),
+    # Date only
+    ("2024-01-15", pa.date32(), datetime.date(2024, 1, 15)),
+    # Time only
+    ("10:30:45", pa.time64('us'), datetime.time(10, 30, 45)),
+    # None values
+    (None, pa.timestamp('us', tz='UTC'), None),
+    ("", pa.timestamp('us', tz='UTC'), None),
+])
+def test_convert_temporal(value, field_type, expected):
+    """Test temporal value conversion from RFC3339 strings."""
+    result = _convert_temporal(value, field_type)
+    assert result == expected
+
+
+def test_convert_temporal_invalid_format():
+    """Test that invalid temporal strings raise errors."""
+    with pytest.raises(ValueError, match="Invalid temporal format"):
+        _convert_temporal("not-a-date", pa.timestamp('us', tz='UTC'))
+
+
+def test_create_pyarrow_table_with_temporal_conversion():
+    """Test end-to-end table creation with temporal values."""
+    schema = pa.schema([
+        pa.field("id", pa.int64()),
+        pa.field("created_at", pa.timestamp('us', tz='UTC')),
+        pa.field("birth_date", pa.date32()),
+    ])
+
+    data = [
+        {"id": 1, "created_at": "2024-01-15T10:30:45Z", "birth_date": "1990-05-20"},
+        {"id": 2, "created_at": "2024-01-16T08:15:30-05:00", "birth_date": "1985-03-10"},
+    ]
+
+    table = create_pyarrow_table(data, schema)
+
+    assert table.schema == schema
+    assert table.num_rows == 2
+    # Verify timestamps are converted
+    timestamps = table.column("created_at").to_pylist()
+    assert timestamps[0] == datetime.datetime(2024, 1, 15, 10, 30, 45, tzinfo=datetime.timezone.utc)
+    assert timestamps[1] == datetime.datetime(2024, 1, 16, 13, 15, 30, tzinfo=datetime.timezone.utc)
+    # Verify dates are converted
+    dates = table.column("birth_date").to_pylist()
+    assert dates[0] == datetime.date(1990, 5, 20)
+    assert dates[1] == datetime.date(1985, 3, 10)

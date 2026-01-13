@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import datetime
+import decimal
 import logging
-from decimal import Decimal
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -15,6 +16,12 @@ FIELD_TYPE_TO_PYARROW = {
     "INTEGER": pa.int64(),
     "NUMBER": pa.float64(),
     "OBJECT": pa.string(),
+}
+
+FORMAT_TO_PYARROW = {
+    "date-time": pa.timestamp('us', tz='UTC'),  # Microsecond precision, UTC
+    "date": pa.date32(),                         # Date-only values
+    "time": pa.time64('us'),                     # Time-only, microsecond precision
 }
 
 
@@ -32,6 +39,19 @@ logger = logging.getLogger(__name__)
 def _field_type_to_pyarrow_field(
     field_name: str, input_types: dict, required_fields: list[str]
 ) -> pa.Field:
+    # Check format field first (for date-time, date, time)
+    field_format = input_types.get("format")
+    if field_format and field_format in FORMAT_TO_PYARROW:
+        nullable = field_name not in required_fields
+        # Check if null is in types
+        types = input_types.get("type", [])
+        types = [types] if isinstance(types, str) else types
+        types_uppercase = [item.upper() for item in types]
+        if "NULL" in types_uppercase:
+            nullable = True
+        return pa.field(field_name, FORMAT_TO_PYARROW[field_format], nullable)
+
+    # Existing type-based logic for non-temporal fields
     types = input_types.get("type", [])
     # If type is not defined, check if anyOf is defined
     if not types:
@@ -86,14 +106,72 @@ def flatten_schema_to_pyarrow_schema(flatten_schema_dictionary: dict) -> pa.Sche
 
 def _convert_decimal(value):
     """Convert Decimal"""
-    if isinstance(value, Decimal):
+    if isinstance(value, decimal.Decimal):
         return float(value)
+    return value
+
+
+def _convert_temporal(value, field_type: pa.DataType):
+    """Convert RFC3339 string to appropriate Python temporal object.
+
+    Args:
+        value: String value in RFC3339 format (or None)
+        field_type: Target PyArrow data type
+
+    Returns:
+        Converted temporal object or None
+    """
+    if value is None or value == "":
+        return None
+
+    if not isinstance(value, str):
+        return value  # Already converted or non-string type
+
+    try:
+        if pa.types.is_timestamp(field_type):
+            # Parse RFC3339 datetime string
+            # Replace 'Z' suffix with '+00:00' for Python compatibility
+            dt = datetime.datetime.fromisoformat(value.replace('Z', '+00:00'))
+            # Ensure timezone-aware, assume UTC if naive
+            if dt.tzinfo is None:
+                return dt.replace(tzinfo=datetime.timezone.utc)
+            else:
+                # Convert to UTC
+                return dt.astimezone(datetime.timezone.utc)
+
+        elif pa.types.is_date(field_type):
+            # Parse date-only value
+            return datetime.datetime.fromisoformat(value).date()
+
+        elif pa.types.is_time(field_type):
+            # Parse time-only value (prepend dummy date for parsing)
+            return datetime.datetime.fromisoformat(f'1970-01-01T{value}').time()
+
+    except (ValueError, AttributeError) as e:
+        logger.error(f"Failed to parse temporal value '{value}': {e}")
+        raise ValueError(f"Invalid temporal format for field with type {field_type}: {value}") from e
+
     return value
 
 
 def create_pyarrow_table(list_dict: list[dict], schema: pa.Schema) -> pa.Table:
     """Create a pyarrow Table from a python list of dict."""
-    data = {f: [_convert_decimal(row.get(f)) for row in list_dict] for f in schema.names}
+    data = {}
+    for field in schema:
+        field_name = field.name
+        field_type = field.type
+        # Apply conversions for each field based on its type
+        column_data = []
+        for row in list_dict:
+            value = row.get(field_name)
+            # Convert decimals
+            value = _convert_decimal(value)
+            # Convert temporal types
+            if pa.types.is_temporal(field_type):
+                value = _convert_temporal(value, field_type)
+            column_data.append(value)
+        data[field_name] = column_data
+
     return pa.table(data).cast(schema)
 
 
